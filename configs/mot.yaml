@@ -4,6 +4,11 @@
 # pipeline: detector, ReID model, tracking/gating/association parameters,
 # and evaluation settings for MOT17 / MOT20.
 
+gstreamer:
+  enabled: false                 # set true to enable GStreamer backend pipeline
+  input_pipeline: null           # optional custom GStreamer input string
+  output_pipeline: null          # optional custom GStreamer output string
+
 detector:
   backend: volo26n              # "volo26n" | "torchvision" | "precomputed"
   model_name: volo26n.pt

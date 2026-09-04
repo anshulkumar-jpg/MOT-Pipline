@@ -52,12 +52,29 @@ def _format_time(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _build_gstreamer_input_pipeline(source: str) -> str:
+    source_str = str(source).strip()
+    if "!" in source_str:
+        return source_str
+    if source_str.startswith("rtsp://"):
+        return f"rtspsrc location={source_str} latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1"
+    if source_str.startswith("udp://"):
+        port = source_str.split(":")[-1].replace("/", "")
+        return f"udpsrc port={port} caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264\" ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1"
+    return f"filesrc location=\"{source_str}\" ! decodebin ! videoconvert ! video/x-raw, format=BGR ! appsink"
+
+
 # ---------------------------------------------------------------------- #
 # track: run the live pipeline over a video / image sequence
 # ---------------------------------------------------------------------- #
 def run_track(args: argparse.Namespace, config: dict) -> None:
     import cv2
     import torch
+
+    try:
+        torch.set_num_threads(max(4, os.cpu_count() or 4))
+    except Exception:
+        pass
 
     from detector.detector import TorchvisionDetector, YOLODetector
     from reid.embedding import MultiBranchReID, preprocess_crop
@@ -133,9 +150,33 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
         association_config=AssociationConfig(**config.get("association", {})),
     )
 
-    cap = cv2.VideoCapture(args.video)
+    gst_cfg = config.get("gstreamer", {})
+    use_gstreamer = (
+        getattr(args, "gstreamer", False)
+        or gst_cfg.get("enabled", False)
+        or args.video.startswith(("rtsp://", "udp://"))
+        or "!" in args.video
+    )
+
+    if use_gstreamer:
+        input_gst = gst_cfg.get("input_pipeline") or _build_gstreamer_input_pipeline(args.video)
+        print(f"[GStreamer] Opening input pipeline:\n  {input_gst}")
+        cap = cv2.VideoCapture(input_gst, cv2.CAP_GSTREAMER)
+        if not cap.isOpened():
+            print("[GStreamer Info] Note: Standard PyPI `opencv-python` on Windows is built without GStreamer C++ bindings.")
+            clean_source = args.video
+            if "location=" in clean_source:
+                try:
+                    clean_source = clean_source.split("location=")[1].split("!")[0].strip("\"' ")
+                except Exception:
+                    pass
+            print(f"[GStreamer Info] Falling back to direct video reader: {clean_source}")
+            cap = cv2.VideoCapture(clean_source)
+    else:
+        cap = cv2.VideoCapture(args.video)
+
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {args.video}")
+        raise RuntimeError(f"Could not open video source: {args.video}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -156,14 +197,29 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
     writer = None
     if args.save_video:
         os.makedirs(os.path.dirname(args.save_video) or ".", exist_ok=True)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.save_video, fourcc, video_fps, (w, h))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+
+        if use_gstreamer:
+            output_gst = gst_cfg.get("output_pipeline") or (
+                f"appsrc ! videoconvert ! video/x-raw, format=BGR ! "
+                f"x264enc speed-preset=ultrafast tune=zerolatency ! mp4mux ! "
+                f"filesink location=\"{args.save_video}\""
+            )
+            print(f"[GStreamer] Opening output pipeline:\n  {output_gst}")
+            writer = cv2.VideoWriter(output_gst, cv2.CAP_GSTREAMER, 0, video_fps, (w, h))
+            if not writer.isOpened():
+                print("[GStreamer Warning] Could not open GStreamer VideoWriter, using OpenCV mp4v fallback...")
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(args.save_video, fourcc, video_fps, (w, h))
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(args.save_video, fourcc, video_fps, (w, h))
 
     result_rows = []
     frame_id = 0
     start_time = time.time()
+    seen_track_ids = set()
 
     while True:
         if max_frames is not None and frame_id >= max_frames:
@@ -182,7 +238,7 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
                 x1, y1, x2, y2 = det.box.astype(int)
                 crop = frame[max(0, y1):y2, max(0, x1):x2]
                 if crop.size == 0:
-                    crop = np.zeros((256, 128, 3), dtype=np.uint8)
+                    crop = np.zeros((160, 80, 3), dtype=np.uint8)
                 crops.append(preprocess_crop(crop))
             batch = torch.stack(crops)
             embeddings = reid_model.embed(batch)
@@ -193,11 +249,14 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
 
         confirmed_tracks = manager.step(boxes, scores, embeddings)
 
+        for trk in confirmed_tracks:
+            seen_track_ids.add(trk.track_id)
+
         for row in manager.results_as_mot_rows():
             result_rows.append(row)
 
         if args.save_video or args.visualize:
-            _draw_tracks(frame, confirmed_tracks)
+            _draw_tracks(frame, confirmed_tracks, total_unique_ids=len(seen_track_ids))
 
         if writer is not None:
             writer.write(frame)
@@ -250,7 +309,7 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
         print(f"Wrote {len(result_rows)} track rows across {frame_id} frames to {args.out}")
 
 
-def _draw_tracks(frame, tracks) -> None:
+def _draw_tracks(frame, tracks, total_unique_ids: Optional[int] = None) -> None:
     import cv2
     colors = [
         (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
@@ -266,6 +325,34 @@ def _draw_tracks(frame, tracks) -> None:
         cv2.rectangle(frame, (x1, max(0, y1 - th - baseline - 4)), (x1 + tw + 6, max(0, y1)), color, -1)
         cv2.putText(frame, label, (x1 + 3, max(th, y1 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    # --- Draw Person Count Badge in Top-Left Corner (Large & Prominent) ---
+    h, w = frame.shape[:2]
+    scale = max(1.15, w / 1100.0)
+    thickness = max(2, int(scale * 2.2))
+
+    live_count = len(tracks)
+    text = f"Total Persons: {live_count}"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+
+    margin = int(20 * (scale / 1.2))
+    pad_x, pad_y = int(18 * scale), int(14 * scale)
+    x_min, y_min = margin, margin
+    x_max, y_max = margin + text_w + (pad_x * 2), margin + text_h + (pad_y * 2)
+
+    # Draw semi-transparent dark background card with thick cyan accent border
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), (15, 15, 15), -1)
+    border_thick = max(2, int(scale * 2.2))
+    cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), (0, 215, 255), border_thick)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+
+    # Render bold white text
+    text_x = x_min + pad_x
+    text_y = y_min + text_h + pad_y - 2
+    cv2.putText(frame, text, (text_x, text_y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 def _write_mot_result(rows, path: str) -> None:
@@ -422,6 +509,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     track_parser.add_argument("--no-tiling", action="store_false", dest="tiling", help="Disable multi-pass grid tiling for 10x-15x faster speed")
     track_parser.add_argument("--device", default=None, help="Device to run inference on: 'cpu', 'cuda', or 'auto'")
     track_parser.add_argument("--fast", action="store_true", help="Enable fast mode (sets imgsz=640 and disables tiling for 10x-15x speedup)")
+    track_parser.add_argument("--gstreamer", "--use-gstreamer", action="store_true", help="Enable GStreamer backend pipeline for RTSP / UDP / file video streams")
 
     annotate_parser = subparsers.add_parser("annotate", help="Run automatic attribute annotation")
     annotate_parser.add_argument("--frames-dir", required=True)
