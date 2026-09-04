@@ -46,11 +46,11 @@ class MultiBranchReID(nn.Module):
         )
         self.embed_dim = embed_dim
 
-        # CPU-only environments are fully supported: default to "cpu" rather
-        # than probing torch.cuda.is_available(), and keep the model + every
-        # inference input pinned to self.device so nothing silently tries to
-        # touch a GPU that may not exist.
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        if device is None or device == "auto":
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            device_str = str(device)
+        self.device = torch.device(device_str)
         self.to(self.device)
 
     def forward(self, x: torch.Tensor) -> Dict:

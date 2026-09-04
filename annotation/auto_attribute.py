@@ -53,7 +53,10 @@ class AutoAttributeAnnotator:
         self.model = attribute_model
         self.schema = schema or DEFAULT_ATTRIBUTE_SCHEMA
         self.config = config or AttributeAnnotationConfig()
-        self.device = device
+        if device is None or device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = str(device)
 
     @torch.no_grad()
     def annotate_batch(self, crops: torch.Tensor) -> Dict[str, np.ndarray]:

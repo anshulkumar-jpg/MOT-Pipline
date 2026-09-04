@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -161,7 +162,7 @@ class PrecomputedDetector(BaseDetector):
 
 class YOLODetector(BaseDetector):
     """
-    Detector backend using Ultralytics YOLO models (e.g. yolo26m, yolov8m, etc.).
+    Detector backend using Ultralytics YOLO/VOLO models (e.g. volo26n, yolov8n, etc.).
     Supports high-resolution inference (`imgsz`), lower confidence thresholds,
     and optional tiled/sliced grid inference for dense crowd detection.
     """
@@ -170,13 +171,15 @@ class YOLODetector(BaseDetector):
 
     def __init__(
         self,
-        model_name: str = "yolo26m.pt",
+        model_name: str = "volo26n.pt",
         weights_path: Optional[str] = None,
-        score_threshold: float = 0.15,
-        imgsz: Optional[int] = 1280,
+        score_threshold: float = 0.10,
+        imgsz: Optional[int] = 352,
         tiling: bool = True,
-        tile_size: int = 640,
-        tile_overlap: float = 0.2,
+        grid_split_3x3: bool = True,
+        include_full_frame: bool = False,
+        tile_size: int = 352,
+        tile_overlap: float = 0.15,
         device: Optional[str] = None,
         person_only: bool = True,
     ):
@@ -195,11 +198,21 @@ class YOLODetector(BaseDetector):
         self.score_threshold = score_threshold
         self.imgsz = imgsz
         self.tiling = tiling
+        self.grid_split_3x3 = grid_split_3x3
+        self.include_full_frame = include_full_frame
         self.tile_size = tile_size
         self.tile_overlap = tile_overlap
         self.person_only = person_only
 
         target = weights_path or model_name
+        if not os.path.exists(target):
+            if os.path.exists(target.replace("volo", "yolo")):
+                target = target.replace("volo", "yolo")
+            elif target in ("volo26n.pt", "volo26n", "yolo26n.pt", "yolo26n", "volo26m.pt", "volo26m", "yolo26m.pt", "yolo26m"):
+                if os.path.exists("yolov8n.pt"):
+                    target = "yolov8n.pt"
+                else:
+                    target = "yolov8n.pt"
         self.model = YOLO(target)
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
@@ -235,26 +248,55 @@ class YOLODetector(BaseDetector):
         h, w = frame.shape[:2]
         all_dets: List[Detection] = []
 
-        # 1. Full frame pass (catches large foreground people)
-        all_dets.extend(self._detect_single(frame))
+        # 1. Full frame pass (ONLY if include_full_frame is True)
+        if self.include_full_frame:
+            all_dets.extend(self._detect_single(frame))
 
-        # 2. Tiled pass (catches small background/dense crowd people)
-        stride = int(self.tile_size * (1.0 - self.tile_overlap))
-        y_starts = list(range(0, h, stride))
-        x_starts = list(range(0, w, stride))
+        # 2. 3x3 Grid Split (9 parts)
+        if self.grid_split_3x3:
+            overlap = self.tile_overlap
+            tile_h = h / 3.0
+            tile_w = w / 3.0
 
-        if y_starts[-1] + self.tile_size < h:
-            y_starts.append(max(0, h - self.tile_size))
-        if x_starts[-1] + self.tile_size < w:
-            x_starts.append(max(0, w - self.tile_size))
+            pad_h = int(tile_h * overlap)
+            pad_w = int(tile_w * overlap)
 
-        for y in y_starts:
-            for x in x_starts:
-                tile = frame[y : y + self.tile_size, x : x + self.tile_size]
-                if tile.shape[0] < 32 or tile.shape[1] < 32:
-                    continue
-                tile_dets = self._detect_single(tile, offset_x=x, offset_y=y)
-                all_dets.extend(tile_dets)
+            y_ranges = [
+                (0, min(h, int(tile_h + pad_h))),
+                (max(0, int(tile_h - pad_h)), min(h, int(2 * tile_h + pad_h))),
+                (max(0, int(2 * tile_h - pad_h)), h),
+            ]
+
+            x_ranges = [
+                (0, min(w, int(tile_w + pad_w))),
+                (max(0, int(tile_w - pad_w)), min(w, int(2 * tile_w + pad_w))),
+                (max(0, int(2 * tile_w - pad_w)), w),
+            ]
+
+            for y1, y2 in y_ranges:
+                for x1, x2 in x_ranges:
+                    tile = frame[y1:y2, x1:x2]
+                    if tile.shape[0] < 32 or tile.shape[1] < 32:
+                        continue
+                    tile_dets = self._detect_single(tile, offset_x=x1, offset_y=y1)
+                    all_dets.extend(tile_dets)
+        else:
+            stride = int(self.tile_size * (1.0 - self.tile_overlap))
+            y_starts = list(range(0, h, stride))
+            x_starts = list(range(0, w, stride))
+
+            if y_starts[-1] + self.tile_size < h:
+                y_starts.append(max(0, h - self.tile_size))
+            if x_starts[-1] + self.tile_size < w:
+                x_starts.append(max(0, w - self.tile_size))
+
+            for y in y_starts:
+                for x in x_starts:
+                    tile = frame[y : y + self.tile_size, x : x + self.tile_size]
+                    if tile.shape[0] < 32 or tile.shape[1] < 32:
+                        continue
+                    tile_dets = self._detect_single(tile, offset_x=x, offset_y=y)
+                    all_dets.extend(tile_dets)
 
         if not all_dets:
             return []

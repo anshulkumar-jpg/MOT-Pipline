@@ -25,7 +25,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import sys
+import time
 from typing import Optional
 
 import numpy as np
@@ -35,6 +38,18 @@ import yaml
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+
+def _format_time(seconds: float) -> str:
+    if seconds is None or seconds < 0 or math.isinf(seconds) or math.isnan(seconds):
+        return "--:--"
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 # ---------------------------------------------------------------------- #
@@ -59,35 +74,46 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
     if score_thresh is None:
         score_thresh = det_cfg.get("score_threshold", 0.25)
 
-    backend = (getattr(args, "backend", None) or det_cfg.get("backend", "yolo26m")).lower()
-    if backend in ("yolo26m", "volo26m", "yolo", "ultralytics", "yolov8") or backend.startswith("yolo") or backend.startswith("volo"):
-        model_name = getattr(args, "model_name", None) or det_cfg.get("model_name", "yolo26m.pt")
-        imgsz = getattr(args, "imgsz", None) or det_cfg.get("imgsz", 1280)
-        tiling = getattr(args, "tiling", None)
-        if tiling is None:
-            tiling = det_cfg.get("tiling", True)
+    backend = (getattr(args, "backend", None) or det_cfg.get("backend", "volo26n")).lower()
+    device = getattr(args, "device", None) or det_cfg.get("device", "auto")
+
+    cli_imgsz = getattr(args, "imgsz", None)
+    cli_tiling = getattr(args, "tiling", None)
+
+    if getattr(args, "fast", False):
+        imgsz = cli_imgsz if cli_imgsz is not None else 640
+        tiling = cli_tiling if cli_tiling is not None else False
+    else:
+        imgsz = cli_imgsz if cli_imgsz is not None else det_cfg.get("imgsz", 352)
+        tiling = cli_tiling if cli_tiling is not None else det_cfg.get("tiling", True)
+
+    if backend in ("volo26n", "yolo26n", "volo26m", "yolo26m", "yolo", "volo", "ultralytics", "yolov8") or backend.startswith("yolo") or backend.startswith("volo"):
+        model_name = getattr(args, "model_name", None) or det_cfg.get("model_name", "volo26n.pt")
         detector = YOLODetector(
             model_name=model_name,
             weights_path=det_cfg.get("weights_path"),
             score_threshold=score_thresh,
             imgsz=imgsz,
             tiling=tiling,
+            grid_split_3x3=det_cfg.get("grid_split_3x3", True),
+            include_full_frame=det_cfg.get("include_full_frame", False),
             tile_size=det_cfg.get("tile_size", 640),
-            tile_overlap=det_cfg.get("tile_overlap", 0.2),
-            device=det_cfg.get("device"),
+            tile_overlap=det_cfg.get("tile_overlap", 0.15),
+            device=device,
         )
     else:
         detector = TorchvisionDetector(
             weights_path=det_cfg.get("weights_path"),
             score_threshold=score_thresh,
-            device=det_cfg.get("device"),
+            device=device,
         )
 
+    reid_device = getattr(args, "device", None) or reid_cfg.get("device", "auto")
     reid_model = MultiBranchReID(
         num_identities=reid_cfg.get("num_identities", 0),
         embed_dim=reid_cfg.get("embed_dim", 512),
         pretrained_backbone=reid_cfg.get("pretrained_backbone", True),
-        device=reid_cfg.get("device", "cpu"),
+        device=reid_device,
     )
     if reid_cfg.get("checkpoint"):
         # map_location="cpu" is always safe here, whether the checkpoint was
@@ -111,18 +137,34 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {args.video}")
 
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    max_frames = getattr(args, "max_frames", None)
+
+    if max_frames is not None and max_frames > 0:
+        target_frames = min(total_frames, max_frames) if total_frames > 0 else max_frames
+    else:
+        target_frames = total_frames
+
+    video_len_sec = total_frames / video_fps if total_frames > 0 and video_fps > 0 else 0
+
+    print(f"\n[MOT Tracker] Video: {args.video}")
+    if target_frames > 0:
+        print(f"[MOT Tracker] Total Frames to process: {target_frames} | Video Length: {_format_time(video_len_sec)} @ {video_fps:.1f} FPS")
+    print("[MOT Tracker] Starting tracking pipeline...\n")
+
     writer = None
     if args.save_video:
         os.makedirs(os.path.dirname(args.save_video) or ".", exist_ok=True)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.save_video, fourcc, fps, (w, h))
+        writer = cv2.VideoWriter(args.save_video, fourcc, video_fps, (w, h))
 
     result_rows = []
     frame_id = 0
-    max_frames = getattr(args, "max_frames", None)
+    start_time = time.time()
+
     while True:
         if max_frames is not None and frame_id >= max_frames:
             break
@@ -164,6 +206,36 @@ def run_track(args: argparse.Namespace, config: dict) -> None:
             cv2.imshow("Identity-Aware MOT", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+
+        # Terminal progress reporting with ETA (Estimated Time Remaining)
+        elapsed = time.time() - start_time
+        fps_speed = frame_id / elapsed if elapsed > 0 else 0.0
+
+        if target_frames > 0:
+            pct = min(100.0, (frame_id / target_frames) * 100)
+            remaining_frames = max(0, target_frames - frame_id)
+            eta_sec = remaining_frames / fps_speed if fps_speed > 0 else 0.0
+
+            bar_len = 20
+            filled_len = int(bar_len * frame_id // target_frames)
+            bar = '█' * filled_len + '-' * (bar_len - filled_len)
+
+            sys.stdout.write(
+                f"\r[Progress] [{bar}] {pct:5.1f}% | Frame {frame_id}/{target_frames} | "
+                f"Speed: {fps_speed:4.1f} fps | Elapsed: {_format_time(elapsed)} | ETA (Remaining Time): {_format_time(eta_sec)}  "
+            )
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(
+                f"\r[Progress] Frame {frame_id} | Speed: {fps_speed:4.1f} fps | Elapsed: {_format_time(elapsed)}  "
+            )
+            sys.stdout.flush()
+
+    if frame_id > 0:
+        sys.stdout.write("\n")
+        total_elapsed = time.time() - start_time
+        avg_fps = frame_id / total_elapsed if total_elapsed > 0 else 0.0
+        print(f"\n[MOT Tracker] Tracking complete! Processed {frame_id} frames in {_format_time(total_elapsed)} (Avg Speed: {avg_fps:.1f} fps)")
 
     cap.release()
     if writer is not None:
@@ -343,8 +415,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     track_parser.add_argument("--visualize", action="store_true", help="Display live tracking window")
     track_parser.add_argument("--score-threshold", "--confidence", type=float, default=None, help="Detection score / confidence threshold override")
     track_parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of frames to process")
-    track_parser.add_argument("--backend", default=None, help="Detector backend (yolo26m, torchvision, etc.)")
-    track_parser.add_argument("--model-name", default=None, help="Detector model name/weights path (e.g. yolo26m.pt)")
+    track_parser.add_argument("--backend", default=None, help="Detector backend (volo26n, torchvision, etc.)")
+    track_parser.add_argument("--model-name", default=None, help="Detector model name/weights path (e.g. volo26n.pt)")
+    track_parser.add_argument("--imgsz", type=int, default=None, help="Inference resolution size (e.g. 640 for fast CPU, 1280 for high precision)")
+    track_parser.add_argument("--tiling", action="store_true", default=None, help="Enable multi-pass grid tiling for small/dense crowd detections (slower)")
+    track_parser.add_argument("--no-tiling", action="store_false", dest="tiling", help="Disable multi-pass grid tiling for 10x-15x faster speed")
+    track_parser.add_argument("--device", default=None, help="Device to run inference on: 'cpu', 'cuda', or 'auto'")
+    track_parser.add_argument("--fast", action="store_true", help="Enable fast mode (sets imgsz=640 and disables tiling for 10x-15x speedup)")
 
     annotate_parser = subparsers.add_parser("annotate", help="Run automatic attribute annotation")
     annotate_parser.add_argument("--frames-dir", required=True)

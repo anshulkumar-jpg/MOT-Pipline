@@ -5,15 +5,17 @@
 # and evaluation settings for MOT17 / MOT20.
 
 detector:
-  backend: yolo26m              # "yolo26m" | "torchvision" | "precomputed"
-  model_name: yolo26m.pt
+  backend: volo26n              # "volo26n" | "torchvision" | "precomputed"
+  model_name: volo26n.pt
   weights_path: null            # optional path to custom weights
-  score_threshold: 0.15
-  imgsz: 1280
-  tiling: true
-  tile_size: 640
-  tile_overlap: 0.2
-  device: cpu                   # "cpu" | "cuda" | "auto"
+  score_threshold: 0.10         # lower threshold (0.10) catches small & occluded people in dense crowds
+  imgsz: 352                    # 352 (multiple of 32 stride) for fast & warning-free inference
+  tiling: true                  # enable 9-part grid tiling
+  grid_split_3x3: true          # split frame into 9 parts (3x3 grid)
+  include_full_frame: false     # do NOT detect on direct full frame; process 9 tiles only
+  tile_size: 352
+  tile_overlap: 0.15
+  device: auto                  # "auto" (uses GPU if available, else CPU) | "cpu" | "cuda"
 
 reid:
   embed_dim: 512
@@ -21,7 +23,7 @@ reid:
   pretrained_backbone: true
   attribute_schema: default     # "default" -> reid/attribute_branch.py::DEFAULT_ATTRIBUTE_SCHEMA
   checkpoint: null              # path to trained MultiBranchReID weights for inference/eval
-  device: cpu                   # "cpu" | "cuda" | "auto"
+  device: auto                  # "auto" | "cpu" | "cuda"
 
 loss:
   w_id: 1.0
