@@ -1,0 +1,12 @@
+numpy>=1.23
+scipy>=1.9
+torch>=2.0
+torchvision>=0.15
+opencv-python>=4.7
+PyYAML>=6.0
+motmetrics>=1.4
+
+# CPU-only machines: install the CPU build of torch/torchvision instead of
+# the line above, which pulls a much smaller wheel with no CUDA runtime:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Everything else in this file installs identically either way.

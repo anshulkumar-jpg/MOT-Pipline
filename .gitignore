@@ -1,0 +1,60 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Environments & Virtual Environments
+.venv/
+venv/
+venv-*/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Weights & Model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.bin
+*.weights
+*.safetensors
+*.ckpt
+*.tflite
+
+# Video & Media output / sample files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Output & Tracking Results
+results/
+runs/
+output/
+outputs/
+*.log
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing & Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

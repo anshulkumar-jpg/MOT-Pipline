@@ -1,0 +1,99 @@
+# mot.yaml
+# --------
+# Central configuration for the Identity-Aware Multi-Object Tracking
+# pipeline: detector, ReID model, tracking/gating/association parameters,
+# and evaluation settings for MOT17 / MOT20.
+
+detector:
+  backend: yolo26m              # "yolo26m" | "torchvision" | "precomputed"
+  model_name: yolo26m.pt
+  weights_path: null            # optional path to custom weights
+  score_threshold: 0.15
+  imgsz: 1280
+  tiling: true
+  tile_size: 640
+  tile_overlap: 0.2
+  device: cpu                   # "cpu" | "cuda" | "auto"
+
+reid:
+  embed_dim: 512
+  num_identities: 1041          # set to training-set identity count
+  pretrained_backbone: true
+  attribute_schema: default     # "default" -> reid/attribute_branch.py::DEFAULT_ATTRIBUTE_SCHEMA
+  checkpoint: null              # path to trained MultiBranchReID weights for inference/eval
+  device: cpu                   # "cpu" | "cuda" | "auto"
+
+loss:
+  w_id: 1.0
+  w_triplet: 1.0
+  w_attr: 0.5
+  triplet_margin: 0.3
+  label_smoothing: 0.1
+
+training:
+  # Defaults below assume a GPU. On CPU-only hardware, training the full
+  # ResNet-50-backbone ReID model is impractically slow at these settings --
+  # drop batch_size to ~8-16 (e.g. identities_per_batch: 4, instances_per_identity: 2)
+  # and expect epoch times an order of magnitude longer. CPU is realistically
+  # only suitable for inference/tracking (see reid.device / detector.device
+  # above), fine-tuning on a small crop set, or debugging the training loop.
+  batch_size: 64
+  identities_per_batch: 16
+  instances_per_identity: 4
+  epochs: 120
+  base_lr: 0.00035
+  lr_scheduler: warmup_multistep
+  warmup_epochs: 10
+  milestones: [40, 70, 100]
+  weight_decay: 0.0005
+  optimizer: adam
+
+annotation:
+  confidence_threshold: 0.75
+  binary_confidence_margin: 0.5
+  enforce_track_consistency: true
+  track_majority_ratio: 0.6
+
+gating:
+  mahalanobis_gate_threshold: 9.4877
+  max_center_distance: 150.0
+  direction_consistency_weight: 0.3
+  aspect_ratio_change_tolerance: 0.35
+  min_iou_for_fast_path: 0.3
+
+association:
+  max_reid_distance: 0.45
+  reid_weight: 0.7
+  motion_weight: 0.3
+  unmatched_cost: 100000.0
+
+track_manager:
+  confirm_hits: 1
+  max_age: 30
+  embedding_gallery_size: 30
+  min_detection_score: 0.15
+
+evaluation:
+  mot17:
+    dataset_root: data/MOT17
+    output_root: outputs/mot17
+    detector_suffix: FRCNN
+    split: train
+    detection_score_threshold: 0.3
+  mot20:
+    dataset_root: data/MOT20
+    output_root: outputs/mot20
+    split: train
+    detection_score_threshold: 0.3
+    gating:
+      max_center_distance: 100.0
+    association:
+      reid_weight: 0.8
+      motion_weight: 0.2
+      max_reid_distance: 0.4
+
+annotation_pipeline:
+  dataset_root: data/annotated_dataset
+  val_ratio: 0.1
+  crop_padding: 0.1
+  seed: 42
